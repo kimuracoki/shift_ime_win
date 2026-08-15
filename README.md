@@ -40,29 +40,39 @@ Windowsの「入力方式」は**日本語IME1本だけ**を使う想定です�
 
 ## ファイル
 
-- `shift_ime.ahk` … AutoHotkey v2 ソースコード
-- `shift_ime.exe` … コンパイル済み実行ファイル（そのまま実行可能、AutoHotkeyのインストール不要）
+- `shift_ime.ahk` … AutoHotkey v2 ソースコード（これ1つだけ。exeは作りません。理由は後述）
+
+## 前提: AutoHotkey v2 の導入
+
+`winget install AutoHotkey.AutoHotkey` で導入済みです。
+インタプリタ本体は `%LOCALAPPDATA%\Programs\AutoHotkey\v2\AutoHotkey64.exe` にあります。
 
 ## 使い方
 
-`shift_ime.exe` をダブルクリックするだけで常駐します。タスクトレイのアイコンから「終了」を選ぶと終了します。
+`shift_ime.ahk` をダブルクリック（AutoHotkey v2 に関連付け済みなら）、
+または以下で常駐します。タスクトレイのアイコンから「終了」を選ぶと終了します。
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\AutoHotkey\v2\AutoHotkey64.exe" "shift_ime.ahk"
+```
 
 ## Windows起動時に自動実行したい場合
 
 1. `Win + R` → `shell:startup` → Enter でスタートアップフォルダを開く
-2. `shift_ime.exe` のショートカットをそのフォルダに置く
+2. そこに新規ショートカットを作り、以下を設定する
+   - リンク先: `%LOCALAPPDATA%\Programs\AutoHotkey\v2\AutoHotkey64.exe "<このリポジトリのパス>\shift_ime.ahk"`
+   - 作業フォルダー: このリポジトリのパス
 
-## ソースを変更した場合の再コンパイル方法
+## exe を配布・コミットしない理由
 
-AutoHotkey v2 と Ahk2Exe コンパイラがインストール済みであれば、以下で再コンパイルできます。
+以前は `Ahk2Exe` でコンパイルした `shift_ime.exe` を同梱していましたが、廃止しました。
 
-```powershell
-& "$env:LOCALAPPDATA\Programs\AutoHotkey\Compiler\Ahk2Exe.exe" `
-  /in "shift_ime.ahk" `
-  /out "shift_ime.exe" `
-  /base "$env:LOCALAPPDATA\Programs\AutoHotkey\v2\AutoHotkey64.exe"
-```
+- Ahk2Exe の出力は「未署名 + 世界に1つしかない低流通のバイナリ + キーフックと `SendInput` を含む」
+  という構成になるため、Microsoft Defender の機械学習判定で `Wacatac.B!ml` として
+  誤検知されます（実際に検知・インシデント起票されました）。
+- さらに `.ahk` を修正して再コンパイルするたびに exe のハッシュが変わるため、
+  ハッシュ単位で許可リストに登録してもらっても、次のビルドで必ず外れます。
 
-(このセットアップでは `winget install AutoHotkey.AutoHotkey` でAutoHotkey v2本体を、
-GitHubの [AutoHotkey/Ahk2Exe](https://github.com/AutoHotkey/Ahk2Exe) releases から
-コンパイラ本体をそれぞれ導入済みです。)
+`.ahk` を `AutoHotkey64.exe`（多数のユーザーが使う既知のバイナリ）に渡して実行すれば、
+検知対象になる自作バイナリ自体が存在しなくなります。機能は完全に同じです。
+`*.exe` は `.gitignore` 済みです。
