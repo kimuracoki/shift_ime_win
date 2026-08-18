@@ -96,9 +96,24 @@ GetFocusedHwnd() {
 ; ------------------------------------------------------------
 ; Shift単体タップの検出
 ;   Shiftが「押されてから離されるまでの間に、他のどれかのキーが
-;   使われたか」を記録し、使われていなければ単体タップとみなす。
+;   使われたか」を判定し、使われていなければ単体タップとみなす。
 ;   他のキーが使われた場合は、Shift本来の修飾キー動作のみを行い
 ;   IME切り替えは発生させない。
+;
+;   判定は2本立てにしている。
+;     (1) A_PriorKey
+;         「Shiftを離す直前に押されていたキー」。それがShift自身なら
+;         単体タップ、それ以外(a や Left など)なら修飾キーとして
+;         使われたことになる。英字キーやShift+矢印もこれで拾える。
+;     (2) g_L/RShiftUsedAsModifier フラグ
+;         リマップ対象の記号キー(RemapHandler)は自前でキーを送出する
+;         ため、A_PriorKeyが送出したキー側で上書きされて紛れやすい。
+;         そのため記号キー側は押された時点で明示的にフラグを立てる。
+;
+;   NOTE: 以前は (2) のフラグだけで判定していたが、フラグを立てるのは
+;   RemapHandler(記号キー)だけだったため、Shiftを押しながら英字を打つと
+;   「単体タップ」と誤判定されていた。結果、右Shiftで大文字を打つたびに
+;   IMEがONになっていた。(1) を足してこれを塞いでいる。
 ; ------------------------------------------------------------
 g_LShiftUsedAsModifier := false
 g_RShiftUsedAsModifier := false
@@ -124,12 +139,12 @@ OnRShiftDown() {
 
 OnLShiftUp() {
     global g_LShiftUsedAsModifier
-    if !g_LShiftUsedAsModifier
+    if (!g_LShiftUsedAsModifier && A_PriorKey = "LShift")
         SetIME(false)
 }
 OnRShiftUp() {
     global g_RShiftUsedAsModifier
-    if !g_RShiftUsedAsModifier
+    if (!g_RShiftUsedAsModifier && A_PriorKey = "RShift")
         SetIME(true)
 }
 
