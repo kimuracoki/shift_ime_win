@@ -3,6 +3,10 @@
 Persistent
 SendMode "Input"
 
+; 既定のIMEウィンドウ(下の IME_Wnd を参照)は隠しウィンドウなので、
+; SendMessage で掴むために必要。
+DetectHiddenWindows true
+
 ; ------------------------------------------------------------
 ; グローバルエラーハンドラ
 ;   未処理の例外が起きると、AutoHotkey v2は既定でスクリプトごと
@@ -37,35 +41,70 @@ OnUnhandledError(exc, mode) {
 ; ------------------------------------------------------------
 ; IME ON/OFF
 ; ------------------------------------------------------------
+; IMEの状態は「既定のIMEウィンドウ」に WM_IME_CONTROL を送って読み書きする。
+; これは定番ライブラリ IME.ahk と同じ方式。
+;
+; ImmGetOpenStatus / ImmSetOpenStatus を直接呼ぶ方式は、IMM32を無効化して
+; TSFだけでIMEを扱うアプリ(Warp、Chrome、WinUI3系など)には効かない。
+; 実測(Warp): ImmGetContext は 0 を返し状態を読めない。一方
+; ImmGetDefaultIMEWnd + IMC_GETOPENSTATUS は正しい値を返す。
+; 既定のIMEウィンドウはスレッドごとに必ず作られるため、この経路なら
+; IMM32非対応のアプリでも読み書きが通る。
+WM_IME_CONTROL := 0x0283
+IMC_GETOPENSTATUS := 0x0005
+IMC_SETOPENSTATUS := 0x0006
+
+; フォーカスのあるコントロールが属するスレッドの、既定のIMEウィンドウ。
+IME_Wnd() {
+    hwnd := GetFocusedHwnd()
+    if !hwnd
+        return 0
+    return DllCall("imm32\ImmGetDefaultIMEWnd", "ptr", hwnd, "ptr")
+}
+
+; IMEがONなら true / OFFなら false / 取得できなければ "" を返す。
+IME_Get(timeoutMs := 1000) {
+    global WM_IME_CONTROL, IMC_GETOPENSTATUS
+
+    imeWnd := IME_Wnd()
+    if !imeWnd
+        return ""
+    try
+        return SendMessage(WM_IME_CONTROL, IMC_GETOPENSTATUS, 0, , "ahk_id " imeWnd, , , , timeoutMs) ? true : false
+    catch ; 相手が応答しない(ハング中など)
+        return ""
+}
+
+; 切り替えられたら true。
+IME_Set(state) {
+    global WM_IME_CONTROL, IMC_SETOPENSTATUS
+
+    imeWnd := IME_Wnd()
+    if !imeWnd
+        return false
+    try
+        SendMessage(WM_IME_CONTROL, IMC_SETOPENSTATUS, state ? 1 : 0, , "ahk_id " imeWnd, , , , 1000)
+    catch
+        return false
+    return true
+}
+
 ; state: true = ON(かな入力) / false = OFF(直接入力)
 ;
-; g_ImeOn は「このスクリプトが最後に設定したIME状態」。Warpのように
-; IMM32非対応(TSFのみ)のアプリでは実際の状態を読み出せないため、
-; jk判定用にここで覚えておく。
-g_ImeOn := false
-
+; 戻り値は「同期メッセージで切り替えたか」。true なら、戻った時点で
+; 既に切り替わっていることが保証される。false(仮想キーへのフォールバック)の
+; ときだけ、後続処理は反映を待つ必要がある。
 SetIME(state) {
-    global g_ImeOn
-    g_ImeOn := state
-
-    ; 方式1: IMM32 (imm32.dll) を直接呼び出す。
-    ; メモ帳(クラシック)やWin32標準のエディットコントロールなど、
-    ; IMM32に対応しているアプリはこれで確実に切り替わる。
-    hwnd := GetFocusedHwnd()
-    if hwnd {
-        himc := DllCall("imm32\ImmGetContext", "ptr", hwnd, "ptr")
-        if himc {
-            DllCall("imm32\ImmSetOpenStatus", "ptr", himc, "int", state)
-            DllCall("imm32\ImmReleaseContext", "ptr", hwnd, "ptr", himc)
-        }
+    if IME_Set(state) {
+        InvalidateIMECache()
+        return true
     }
 
-    ; 方式2: IME ON/OFF専用の仮想キー (VK_IME_ON=0x16 / VK_IME_OFF=0x1A)。
-    ; Chrome・Electron製アプリ・最近のUWP/WinUI3アプリ(新しいメモ帳など)は
-    ; IMM32を無効化しTSFのみでIMEを扱うため方式1だけでは効かない。
-    ; この仮想キーはTSF側がシステム全体でフックしているため、
-    ; 対象アプリがIMM32非対応でも切り替わる。
+    ; フォールバック: IME ON/OFF専用の仮想キー (VK_IME_ON=0x16 / VK_IME_OFF=0x1A)。
+    ; 既定のIMEウィンドウが取れないアプリのための保険。
     SendInput(state ? "{vk16}" : "{vk1A}")
+    InvalidateIMECache()
+    return false
 }
 
 ; フォアグラウンドウィンドウの、実際にフォーカスを持っている
@@ -290,13 +329,12 @@ ToggleUSMode(*) {
 ; 設計方針
 ;   ・IMEがOFFのときは一切介入しない。nvim側の jk マッピングがそのまま
 ;     効くし、ノーマルモードの j 移動にも遅延が出ない。
-;   ・nvimが「今この瞬間、IMEさえ無ければ自分でjkを処理していた」と
-;     言っているときだけ介入する。判定はnvim側が書く状態ファイルを見る
-;     (下の IsNvimJkActive を参照)。Warpのウィンドウタイトルは
-;     Warpが独自に付けていて動いているプログラムを表さないため、
-;     AHK側だけではnvimかシェルかを区別できない。
 ;   ・対象プロセス(既定はWarp)以外でも介入しない。日本語入力の
 ;     「じゃ/じゅ/じょ」等に余計な遅延と誤爆を持ち込まないため。
+;   ・nvimかシェルかまでは区別しない。Warpのウィンドウタイトルは
+;     Warpが独自に付けていて動いているプログラムを表さないため、
+;     AHK側だけでは判別できない。日本語のローマ字入力で jk が並ぶことは
+;     まずないので、シェル側での誤爆は実害が出ない範囲とみなす。
 ;   ・j は押された時点では送らずに保留し、続く1キーを見てから判断する。
 ;     k なら Esc、それ以外なら「j → そのキー」の順で改めて送出する。
 ;     先に j を通してしまうとIMEの変換バッファに ｊ が残り、
@@ -311,25 +349,19 @@ JK_TARGET_PROCESSES := ["warp.exe"]
 ; nvim側の timeoutlen (このPCでは300) と揃えてある。
 JK_TIMEOUT := 300
 
-; IMEをOFFにしてから Esc を送るまでの待ち。
-; IME/TSF側の処理が終わる前に Esc を送るとIMEに食われることがあるため
-; 少しだけ間を空ける。効かない場合はここを増やす。
-JK_IME_OFF_DELAY := 20
+; SetIME() が仮想キー送出にフォールバックしたときだけ、反映を待つ時間。
+; 同期メッセージで切り替えられた場合は待つ必要がない。
+JK_IME_OFF_FALLBACK_DELAY := 20
 
 ; スキャンコード(物理キー位置)で指定する。US/JISどちらのレイアウト設定でも
 ; 同じ物理キーを指す。sc024 = j / sc025 = k。
 JK_SC_J := "sc024"
+JK_SC_K := "sc025"
 
-; nvimが自分の状態を書き出すファイル。書き手は nvim 設定側の
-; lua/config/ime_jk.lua (%LOCALAPPDATA%\nvim)。
-;   "1 <pid>" … 横取りしてよい / "0" … だめ
-JK_STATE_FILE := A_Temp "\nvim_ime_jk_state"
+; 押しっぱなしの状態そのものに意味があるキー。保留中も止めずに素通しし、
+; 「次に押されたキー」としても数えない。
+JK_MODIFIER_KEYS := "{LShift}{RShift}{LControl}{RControl}{LAlt}{RAlt}{LWin}{RWin}"
 
-; ProcessExist はプロセス一覧のスナップショットを取るので、
-; キー入力のたびに呼ばずに少しキャッシュする。
-g_JkPid := 0
-g_JkPidAlive := false
-g_JkPidCheckedAt := 0
 
 IsJkTargetWindow() {
     global JK_TARGET_PROCESSES
@@ -343,119 +375,135 @@ IsJkTargetWindow() {
     return false
 }
 
-; IMEがONかどうか。
-; IMM32対応アプリなら実際の状態を読めるので、読めたときは追跡値も
-; そこへ合わせる(自己修復)。WarpのようなTSFのみのアプリでは読めないため、
-; SetIME()で自分が設定した値を覚えておいて、それを使う。
+; IMEがONかどうか。状態が取れないときは介入しない側に倒す。
+;
+; これは #HotIf から、つまりキーボードフックの経路から毎回呼ばれる。
+; IME_Get() はプロセス間の同期メッセージなので、相手(ターミナル)が
+; メッセージを処理できない状態だと、その間キー入力全体が止まる。
+; Windows全体が固まって見えるので、ここでは
+;   ・問い合わせのタイムアウトを短くする
+;   ・直近の結果をごく短時間だけ使い回す
+; の両方で、1キーあたりの最悪待ち時間を抑える。
+IME_QUERY_TIMEOUT := 100 ; ms
+IME_CACHE_TTL := 50      ; ms
+
+g_ImeCachedAt := 0
+g_ImeCached := false
+
+; 自分でIMEを切り替えたときは、次の問い合わせを必ず実測させる。
+InvalidateIMECache() {
+    global g_ImeCachedAt
+    g_ImeCachedAt := 0
+}
+
 IsIMEOn() {
-    global g_ImeOn
+    global g_ImeCachedAt, g_ImeCached, IME_QUERY_TIMEOUT, IME_CACHE_TTL
 
-    hwnd := GetFocusedHwnd()
-    if hwnd {
-        himc := DllCall("imm32\ImmGetContext", "ptr", hwnd, "ptr")
-        if himc {
-            st := DllCall("imm32\ImmGetOpenStatus", "ptr", himc)
-            DllCall("imm32\ImmReleaseContext", "ptr", hwnd, "ptr", himc)
-            g_ImeOn := st ? true : false
-        }
-    }
+    if (g_ImeCachedAt && A_TickCount - g_ImeCachedAt <= IME_CACHE_TTL)
+        return g_ImeCached
 
-    return g_ImeOn
+    g_ImeCached := (IME_Get(IME_QUERY_TIMEOUT) = true)
+    g_ImeCachedAt := A_TickCount
+    return g_ImeCached
 }
 
-; nvimが「今 jk を横取りしてよい」と言っているか。
-;
-; nvim側は挿入モード/ターミナルのジョブモードに入るたびに、その場に実際に
-; jk マッピングがあるかを maparg で見て書き出している。したがってここでは
-; モードやバッファ種別を推測する必要がない。
-;
-; pid を併せて検証するのは、nvimが異常終了して "1" が残った場合の保険。
-; それが無いと、死んだnvimの残骸のせいでWarpのシェルにEscが飛び続ける。
-IsNvimJkActive() {
-    global JK_STATE_FILE, g_JkPid, g_JkPidAlive, g_JkPidCheckedAt
-
-    ; nvimが書き込み中で一瞬読めないことがある。その1回を諦めるだけでよい。
-    try
-        raw := FileRead(JK_STATE_FILE, "UTF-8")
-    catch
-        return false
-
-    parts := StrSplit(Trim(raw, " `t`r`n"), " ")
-    if (parts.Length < 2 || parts[1] != "1")
-        return false
-
-    pid := Integer(parts[2])
-    if (pid != g_JkPid || A_TickCount - g_JkPidCheckedAt > 1000) {
-        g_JkPid := pid
-        g_JkPidCheckedAt := A_TickCount
-        g_JkPidAlive := ProcessExist(pid) ? true : false
-    }
-    return g_JkPidAlive
-}
-
-; 判定は軽い順に並べる(ウィンドウ → 状態ファイル → IME)。
-#HotIf IsJkTargetWindow() && IsNvimJkActive() && IsIMEOn()
+; 判定は軽い順に並べる(ウィンドウ → IME)。
+#HotIf IsJkTargetWindow() && IsIMEOn()
 ; 修飾キーなしの j のみ。Shift+J や Ctrl+J は素通しさせたいので "*" は付けない。
 sc024::HandleJ()
 #HotIf
 
 HandleJ() {
-    global JK_TIMEOUT, JK_SC_J
+    global JK_TIMEOUT, JK_SC_J, JK_SC_K
 
     loop {
-        ; 文字キーは既定でブロックされる(VisibleText=false)。
-        ; 非文字キーは素通ししてしまい j との順序が入れ替わるため、
-        ; よく使うものは EndKeys に入れたうえで VisibleNonText=false で止め、
-        ; あとから自分で送り直す。
-        ih := InputHook("L1 T" (JK_TIMEOUT / 1000),
-            "{Enter}{Escape}{Backspace}{Tab}{Delete}{Left}{Right}{Up}{Down}{Home}{End}")
-        ih.VisibleNonText := false
-        ih.Start()
-        ih.Wait()
+        next := WaitNextKey(JK_TIMEOUT)
 
-        ; 何も来ないまま時間切れ → ただの j だったので送る
-        if (ih.EndReason = "Timeout") {
-            SendInput("{" JK_SC_J "}")
+        ; 時間切れ。ただの j だったので送る。
+        if !next {
+            ReplayKey(JK_SC_J)
             return
         }
 
         ; jk 成立
-        if (ih.Input = "k") {
+        if (next = JK_SC_K) {
             EscapeFromIME()
             return
         }
 
-        ; jk ではなかった。保留していた j を先に送り、順序を保つ。
-        SendInput("{" JK_SC_J "}")
+        ; jk ではなかった。保留していた j を先に送り、入力順を保つ。
+        ReplayKey(JK_SC_J)
 
-        ; "jj" の2つ目は、次が k なら jk として成立させたいので再び保留する
-        if (ih.Input = "j")
+        ; "jj" の2つ目は、次が k なら jk として成立させたいので再び保留する。
+        if (next = JK_SC_J)
             continue
 
-        if (ih.EndReason = "EndKey") {
-            SendInput("{" ih.EndKey "}")
-            return
-        }
-
-        ; 拾った1文字を「本物のキー入力」として送り直す。
-        ; SendTextではIME/TSFを素通りしてしまうため SendAsRealKey を使う。
-        if (ih.Input != "")
-            SendAsRealKey(ih.Input)
+        ReplayKey(next)
         return
     }
 }
 
-EscapeFromIME() {
-    global JK_IME_OFF_DELAY
+; j を保留している間、次の「修飾キー以外のキー」をひとつ待つ。
+;
+; 待っている間のキーはすべてこちらで止める(S)。止めないと、保留中の j より
+; 先にアプリへ届いて入力順が入れ替わる。例外は修飾キーで、これは押されている
+; 状態そのものに意味があるため素通しし、「次のキー」としても数えずに待ち続ける。
+;
+; 戻り値: "sc025" のようなスキャンコード文字列。時間切れなら 0。
+g_JkNextKey := 0
 
-    ; 先にIMEをOFFにする。変換中の文字列が残っている場合、
-    ; 先にEscを送るとIMEがEscを食って変換を取り消してしまうため、
-    ; 必ずOFF(=未確定文字列の確定)を先に行う。
-    SetIME(false)
-    Sleep(JK_IME_OFF_DELAY)
-    SendInput("{Escape}")
+WaitNextKey(timeoutMs) {
+    global g_JkNextKey, JK_MODIFIER_KEYS
+
+    g_JkNextKey := 0
+
+    ih := InputHook("L0 T" (timeoutMs / 1000)) ; L0: 文字は集めない。通知だけ使う
+    ih.KeyOpt("{All}", "NS")                   ; N=通知する / S=アプリへ通さない
+    ih.KeyOpt(JK_MODIFIER_KEYS, "-S")          ; 修飾キーだけは素通し
+    ih.OnKeyDown := OnJkWaitKey
+    ih.Start()
+    ih.Wait()
+
+    return g_JkNextKey
 }
 
+OnJkWaitKey(hook, vk, sc) {
+    global g_JkNextKey
+
+    if IsModifierVK(vk)
+        return
+
+    g_JkNextKey := Format("sc{:03X}", sc)
+    hook.Stop()
+}
+
+IsModifierVK(vk) {
+    static mods := Map(
+        0x10, true, 0x11, true, 0x12, true, ; Shift / Ctrl / Alt (左右不問)
+        0xA0, true, 0xA1, true,             ; LShift / RShift
+        0xA2, true, 0xA3, true,             ; LCtrl / RCtrl
+        0xA4, true, 0xA5, true,             ; LAlt / RAlt
+        0x5B, true, 0x5C, true)             ; LWin / RWin
+    return mods.Has(vk)
+}
+
+; 物理キー位置(スキャンコード)そのままで送り直す。
+; {Blind} を付けるのは、今押されている修飾キーをAHKが勝手に上げ下げせず、
+; ユーザーが押している状態のまま適用させるため。
+ReplayKey(sc) {
+    SendInput("{Blind}{" sc "}")
+}
+
+EscapeFromIME() {
+    global JK_IME_OFF_FALLBACK_DELAY
+
+    ; 先にIMEをOFFにする。変換中の文字列が残っている場合、先にEscを送ると
+    ; IMEがEscを食って変換を取り消してしまうため、必ずOFFを先に行う。
+    if !SetIME(false)
+        Sleep(JK_IME_OFF_FALLBACK_DELAY) ; 仮想キー送出は非同期なので反映を待つ
+
+    SendInput("{Escape}")
+}
 
 ; ------------------------------------------------------------
 ; 緊急終了ホットキー
@@ -473,7 +521,7 @@ EscapeFromIME() {
 ; ------------------------------------------------------------
 TRAY_LABEL_INFO := "Shift-IME (LShift=OFF / RShift=ON)"
 TRAY_LABEL_USMODE := "USキーボード配列モード (Win+F12)"
-TRAY_LABEL_JK := "jk = Esc + IME OFF (nvim挿入モード + IME ON時)"
+TRAY_LABEL_JK := "jk = Esc + IME OFF (IME ON時 / Warp)"
 TRAY_LABEL_EMERGENCY := "緊急終了: Ctrl+Alt+Shift+F12"
 
 A_TrayMenu.Delete()
