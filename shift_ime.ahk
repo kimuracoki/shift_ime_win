@@ -290,6 +290,11 @@ ToggleUSMode(*) {
 ; 設計方針
 ;   ・IMEがOFFのときは一切介入しない。nvim側の jk マッピングがそのまま
 ;     効くし、ノーマルモードの j 移動にも遅延が出ない。
+;   ・nvimが「今この瞬間、IMEさえ無ければ自分でjkを処理していた」と
+;     言っているときだけ介入する。判定はnvim側が書く状態ファイルを見る
+;     (下の IsNvimJkActive を参照)。Warpのウィンドウタイトルは
+;     Warpが独自に付けていて動いているプログラムを表さないため、
+;     AHK側だけではnvimかシェルかを区別できない。
 ;   ・対象プロセス(既定はWarp)以外でも介入しない。日本語入力の
 ;     「じゃ/じゅ/じょ」等に余計な遅延と誤爆を持ち込まないため。
 ;   ・j は押された時点では送らずに保留し、続く1キーを見てから判断する。
@@ -314,6 +319,17 @@ JK_IME_OFF_DELAY := 20
 ; スキャンコード(物理キー位置)で指定する。US/JISどちらのレイアウト設定でも
 ; 同じ物理キーを指す。sc024 = j / sc025 = k。
 JK_SC_J := "sc024"
+
+; nvimが自分の状態を書き出すファイル。書き手は nvim 設定側の
+; lua/config/ime_jk.lua (%LOCALAPPDATA%\nvim)。
+;   "1 <pid>" … 横取りしてよい / "0" … だめ
+JK_STATE_FILE := A_Temp "\nvim_ime_jk_state"
+
+; ProcessExist はプロセス一覧のスナップショットを取るので、
+; キー入力のたびに呼ばずに少しキャッシュする。
+g_JkPid := 0
+g_JkPidAlive := false
+g_JkPidCheckedAt := 0
 
 IsJkTargetWindow() {
     global JK_TARGET_PROCESSES
@@ -347,7 +363,38 @@ IsIMEOn() {
     return g_ImeOn
 }
 
-#HotIf IsJkTargetWindow() && IsIMEOn()
+; nvimが「今 jk を横取りしてよい」と言っているか。
+;
+; nvim側は挿入モード/ターミナルのジョブモードに入るたびに、その場に実際に
+; jk マッピングがあるかを maparg で見て書き出している。したがってここでは
+; モードやバッファ種別を推測する必要がない。
+;
+; pid を併せて検証するのは、nvimが異常終了して "1" が残った場合の保険。
+; それが無いと、死んだnvimの残骸のせいでWarpのシェルにEscが飛び続ける。
+IsNvimJkActive() {
+    global JK_STATE_FILE, g_JkPid, g_JkPidAlive, g_JkPidCheckedAt
+
+    ; nvimが書き込み中で一瞬読めないことがある。その1回を諦めるだけでよい。
+    try
+        raw := FileRead(JK_STATE_FILE, "UTF-8")
+    catch
+        return false
+
+    parts := StrSplit(Trim(raw, " `t`r`n"), " ")
+    if (parts.Length < 2 || parts[1] != "1")
+        return false
+
+    pid := Integer(parts[2])
+    if (pid != g_JkPid || A_TickCount - g_JkPidCheckedAt > 1000) {
+        g_JkPid := pid
+        g_JkPidCheckedAt := A_TickCount
+        g_JkPidAlive := ProcessExist(pid) ? true : false
+    }
+    return g_JkPidAlive
+}
+
+; 判定は軽い順に並べる(ウィンドウ → 状態ファイル → IME)。
+#HotIf IsJkTargetWindow() && IsNvimJkActive() && IsIMEOn()
 ; 修飾キーなしの j のみ。Shift+J や Ctrl+J は素通しさせたいので "*" は付けない。
 sc024::HandleJ()
 #HotIf
@@ -426,7 +473,7 @@ EscapeFromIME() {
 ; ------------------------------------------------------------
 TRAY_LABEL_INFO := "Shift-IME (LShift=OFF / RShift=ON)"
 TRAY_LABEL_USMODE := "USキーボード配列モード (Win+F12)"
-TRAY_LABEL_JK := "jk = Esc + IME OFF (IME ON時 / Warpのみ)"
+TRAY_LABEL_JK := "jk = Esc + IME OFF (nvim挿入モード + IME ON時)"
 TRAY_LABEL_EMERGENCY := "緊急終了: Ctrl+Alt+Shift+F12"
 
 A_TrayMenu.Delete()
