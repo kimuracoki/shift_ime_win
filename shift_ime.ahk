@@ -24,6 +24,8 @@ OnUnhandledError(exc, mode) {
 ;   ・Shiftを他のキーと組み合わせて使った場合(大文字入力、Shift+2など)は
 ;     IME切り替えは一切発生しない。Shift本来の修飾キーとしての動作のみ。
 ;   ・USキーボード接続時、Win+F12でJIS⇔US記号キー配列を切り替え可能。
+;   ・Warpで「IMEがONのとき」に限り jk → IME OFF + Esc。
+;     (nvimの inoremap jk <Esc> はIMEがONだとjもkもIMEに吸われて届かないため)
 ;
 ; USキーボードでも動作する理由
 ;   LShift/RShiftや各記号キーはすべて「物理キー位置」で判定しており
@@ -36,7 +38,16 @@ OnUnhandledError(exc, mode) {
 ; IME ON/OFF
 ; ------------------------------------------------------------
 ; state: true = ON(かな入力) / false = OFF(直接入力)
+;
+; g_ImeOn は「このスクリプトが最後に設定したIME状態」。Warpのように
+; IMM32非対応(TSFのみ)のアプリでは実際の状態を読み出せないため、
+; jk判定用にここで覚えておく。
+g_ImeOn := false
+
 SetIME(state) {
+    global g_ImeOn
+    g_ImeOn := state
+
     ; 方式1: IMM32 (imm32.dll) を直接呼び出す。
     ; メモ帳(クラシック)やWin32標準のエディットコントロールなど、
     ; IMM32に対応しているアプリはこれで確実に切り替わる。
@@ -254,6 +265,137 @@ ToggleUSMode(*) {
 
 
 ; ------------------------------------------------------------
+; jk で Esc + IME OFF (nvim 用)
+;
+; nvim 側には inoremap jk <Esc> があるが、IMEがONの間は j も k も
+; IMEに吸われてローマ字変換バッファに入ってしまい、nvimまで届かない。
+; そのため「IMEがONのときだけ」AHK側で jk を横取りし、
+; IMEをOFFにしてから Esc をnvimに送る。
+;
+; 設計方針
+;   ・IMEがOFFのときは一切介入しない。nvim側の jk マッピングがそのまま
+;     効くし、ノーマルモードの j 移動にも遅延が出ない。
+;   ・対象プロセス(既定はWarp)以外でも介入しない。日本語入力の
+;     「じゃ/じゅ/じょ」等に余計な遅延と誤爆を持ち込まないため。
+;   ・j は押された時点では送らずに保留し、続く1キーを見てから判断する。
+;     k なら Esc、それ以外なら「j → そのキー」の順で改めて送出する。
+;     先に j を通してしまうとIMEの変換バッファに ｊ が残り、
+;     後から消す手段が不確実になるので、必ず保留してから判断する。
+; ------------------------------------------------------------
+
+; 対象プロセス。ここに exe 名を足せば他のターミナル/エディタでも有効になる。
+; 例: JK_TARGET_PROCESSES := ["warp.exe", "WindowsTerminal.exe", "neovide.exe"]
+JK_TARGET_PROCESSES := ["warp.exe"]
+
+; j を押してから k を待つ猶予(ミリ秒)。
+; nvim側の timeoutlen (このPCでは300) と揃えてある。
+JK_TIMEOUT := 300
+
+; IMEをOFFにしてから Esc を送るまでの待ち。
+; IME/TSF側の処理が終わる前に Esc を送るとIMEに食われることがあるため
+; 少しだけ間を空ける。効かない場合はここを増やす。
+JK_IME_OFF_DELAY := 20
+
+; スキャンコード(物理キー位置)で指定する。US/JISどちらのレイアウト設定でも
+; 同じ物理キーを指す。sc024 = j / sc025 = k。
+JK_SC_J := "sc024"
+
+IsJkTargetWindow() {
+    global JK_TARGET_PROCESSES
+    try
+        proc := WinGetProcessName("A")
+    catch
+        return false
+    for p in JK_TARGET_PROCESSES
+        if (proc = p) ; AHKの = は大文字小文字を区別しない
+            return true
+    return false
+}
+
+; IMEがONかどうか。
+; IMM32対応アプリなら実際の状態を読めるので、読めたときは追跡値も
+; そこへ合わせる(自己修復)。WarpのようなTSFのみのアプリでは読めないため、
+; SetIME()で自分が設定した値を覚えておいて、それを使う。
+IsIMEOn() {
+    global g_ImeOn
+
+    hwnd := GetFocusedHwnd()
+    if hwnd {
+        himc := DllCall("imm32\ImmGetContext", "ptr", hwnd, "ptr")
+        if himc {
+            st := DllCall("imm32\ImmGetOpenStatus", "ptr", himc)
+            DllCall("imm32\ImmReleaseContext", "ptr", hwnd, "ptr", himc)
+            g_ImeOn := st ? true : false
+        }
+    }
+
+    return g_ImeOn
+}
+
+#HotIf IsJkTargetWindow() && IsIMEOn()
+; 修飾キーなしの j のみ。Shift+J や Ctrl+J は素通しさせたいので "*" は付けない。
+sc024::HandleJ()
+#HotIf
+
+HandleJ() {
+    global JK_TIMEOUT, JK_SC_J
+
+    loop {
+        ; 文字キーは既定でブロックされる(VisibleText=false)。
+        ; 非文字キーは素通ししてしまい j との順序が入れ替わるため、
+        ; よく使うものは EndKeys に入れたうえで VisibleNonText=false で止め、
+        ; あとから自分で送り直す。
+        ih := InputHook("L1 T" (JK_TIMEOUT / 1000),
+            "{Enter}{Escape}{Backspace}{Tab}{Delete}{Left}{Right}{Up}{Down}{Home}{End}")
+        ih.VisibleNonText := false
+        ih.Start()
+        ih.Wait()
+
+        ; 何も来ないまま時間切れ → ただの j だったので送る
+        if (ih.EndReason = "Timeout") {
+            SendInput("{" JK_SC_J "}")
+            return
+        }
+
+        ; jk 成立
+        if (ih.Input = "k") {
+            EscapeFromIME()
+            return
+        }
+
+        ; jk ではなかった。保留していた j を先に送り、順序を保つ。
+        SendInput("{" JK_SC_J "}")
+
+        ; "jj" の2つ目は、次が k なら jk として成立させたいので再び保留する
+        if (ih.Input = "j")
+            continue
+
+        if (ih.EndReason = "EndKey") {
+            SendInput("{" ih.EndKey "}")
+            return
+        }
+
+        ; 拾った1文字を「本物のキー入力」として送り直す。
+        ; SendTextではIME/TSFを素通りしてしまうため SendAsRealKey を使う。
+        if (ih.Input != "")
+            SendAsRealKey(ih.Input)
+        return
+    }
+}
+
+EscapeFromIME() {
+    global JK_IME_OFF_DELAY
+
+    ; 先にIMEをOFFにする。変換中の文字列が残っている場合、
+    ; 先にEscを送るとIMEがEscを食って変換を取り消してしまうため、
+    ; 必ずOFF(=未確定文字列の確定)を先に行う。
+    SetIME(false)
+    Sleep(JK_IME_OFF_DELAY)
+    SendInput("{Escape}")
+}
+
+
+; ------------------------------------------------------------
 ; 緊急終了ホットキー
 ;   タスクトレイのアイコンは通知領域の「隠れているインジケーター」に
 ;   格納され気づきにくいことがあるため、万が一入力がおかしくなった
@@ -269,11 +411,14 @@ ToggleUSMode(*) {
 ; ------------------------------------------------------------
 TRAY_LABEL_INFO := "Shift-IME (LShift=OFF / RShift=ON)"
 TRAY_LABEL_USMODE := "USキーボード配列モード (Win+F12)"
+TRAY_LABEL_JK := "jk = Esc + IME OFF (IME ON時 / Warpのみ)"
 TRAY_LABEL_EMERGENCY := "緊急終了: Ctrl+Alt+Shift+F12"
 
 A_TrayMenu.Delete()
 A_TrayMenu.Add(TRAY_LABEL_INFO, (*) => "")
 A_TrayMenu.Disable(TRAY_LABEL_INFO)
+A_TrayMenu.Add(TRAY_LABEL_JK, (*) => "")
+A_TrayMenu.Disable(TRAY_LABEL_JK)
 A_TrayMenu.Add(TRAY_LABEL_EMERGENCY, (*) => "")
 A_TrayMenu.Disable(TRAY_LABEL_EMERGENCY)
 A_TrayMenu.Add(TRAY_LABEL_USMODE, ToggleUSMode)
