@@ -535,7 +535,7 @@ A_TrayMenu.Add(TRAY_LABEL_USMODE, ToggleUSMode)
 A_TrayMenu.Add()
 A_TrayMenu.Add("終了", (*) => ExitApp())
 A_TrayMenu.Default := "終了"
-TraySetIcon("shell32.dll", 78)
+TraySetIcon("shell32.dll", 174)
 
 UpdateTrayState() {
     global g_USMode
