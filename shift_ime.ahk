@@ -96,8 +96,13 @@ IME_Set(state) {
 ; 既に切り替わっていることが保証される。false(仮想キーへのフォールバック)の
 ; ときだけ、後続処理は反映を待つ必要がある。
 SetIME(state) {
+    ; 切り替えの前後どちらでも同期キーが飛んでくる可能性があるため、
+    ; 前後の両方でガード期間を張り直す。詳細は IsImeSyncKey のコメント。
+    NoteImeChanged()
+
     if IME_Set(state) {
         InvalidateIMECache()
+        NoteImeChanged()
         return true
     }
 
@@ -105,7 +110,71 @@ SetIME(state) {
     ; 既定のIMEウィンドウが取れないアプリのための保険。
     SendInput(state ? "{vk16}" : "{vk1A}")
     InvalidateIMECache()
+    NoteImeChanged()
     return false
+}
+
+
+; ------------------------------------------------------------
+; RDPセッション対策: IME同期のための擬似キーを弾く
+;
+; Microsoft Remote Desktop(Mac版)は、セッション内のIME状態が変わると、
+; クライアント側の入力ソースと辻褄を合わせるために「かな」(sc070)や
+; 「半角/全角」(sc029)のキーイベントをセッションに送り込んでくる。
+; ユーザーの打鍵ではないが、injectedフラグも立たないため物理キーと
+; 区別が付かない形で届く。
+;
+; 実測(Mac→Win11 RDP、左Shiftを1回タップしただけのとき):
+;     DOWN vkA0 sc02A  physical   ← 左Shift
+;     UP   vkA0 sc02A  physical   ← 離した。ここで SetIME(false)
+;     UP   vkF0 sc070  physical   ┐ クライアントが送り込むIME同期キー。
+;     DOWN vkF2 sc070  physical   │ 打鍵ではないので UP → DOWN の順で来る
+;     UP   vkF3 sc029  physical   │ (本物の打鍵なら DOWN → UP)。
+;     DOWN vkF4 sc029  physical   ┘
+;
+; この擬似キーは2つの実害を出す。
+;
+;   (1) sc029 はUSキーボードの ` キーと同じ物理位置なので、RemapHandler に
+;       打鍵として拾われ、Shift+VK_OEM_3(=JIS配列の `)が送出される。結果
+;       「左Shiftを押しただけなのに ` が入力される」ことになる。IMEがONの
+;       ウィンドウ(Windowsの検索ボックスなど)では、MS-IMEがスキャンコードを
+;       US配列として読み直すため、同じ操作で ｛ が出る。
+;
+;   (2) vkF2 = VK_DBE_HIRAGANA / vkF4 = VK_DBE_DBCSCHAR、つまり
+;       「ひらがな入力・全角へ」を意味する。こちらが左ShiftでIMEをOFFに
+;       したそばから、クライアントがIMEをONへ巻き戻してしまう。
+;       左Shiftを押してもIMEが切れないのはこれが原因。
+;
+; 打鍵かどうかをVKで見分けることはできない。JIS配列設定下では sc029 は
+; 本物の打鍵でも vkF3/vkF4 (半角/全角) を返すためである。そこで
+; 「自分でIME状態を変えた直後の短い間だけ、これらのキーを捨てる」ことで弾く。
+; 同期キーは実測で0〜16ms後に届くので150msあれば足りる。
+;
+; 捨てるのは sc029 と sc070 の両方でなければならない。片方だけ落とすと
+; 「かなモードなのに文字モードは半角」のような中途半端な状態が残り、
+; 変換が効かなくなる。組で来るものは組で捨てる。
+;
+; 副作用: IMEを切り替えた直後150ms以内に打った ` / かな / 半角全角キーは
+; 1打だけ無視される。Shiftタップは意図的な操作なので実用上は問題にならない。
+; ------------------------------------------------------------
+IME_SYNC_GUARD_MS := 150
+g_ImeSyncGuardUntil := 0
+
+NoteImeChanged() {
+    global g_ImeSyncGuardUntil, IME_SYNC_GUARD_MS
+    g_ImeSyncGuardUntil := A_TickCount + IME_SYNC_GUARD_MS
+}
+
+; いま「自分でIME状態を変えた直後」か。HotIf の条件としても使うため
+; 引数を受け取れるようにしてある(HotIfはホットキー名を渡してくる)。
+InImeSyncWindow(*) {
+    global g_ImeSyncGuardUntil
+    return A_TickCount < g_ImeSyncGuardUntil
+}
+
+; そのスキャンコードが、RDPクライアントのIME同期キーとして届いたものか。
+IsImeSyncKey(sc) {
+    return (sc = "029" || sc = "070") && InImeSyncWindow()
 }
 
 ; フォアグラウンドウィンドウの、実際にフォーカスを持っている
@@ -246,12 +315,30 @@ RemapKeys := [
 for k in RemapKeys
     Hotkey "*sc" k["sc"], RemapHandler.Bind(k["sc"], k["un"], k["sh"])
 
+; かなキー(sc070)はリマップ対象ではないので、普段はホットキーを置かない
+; (置くと素通しさせるだけの無駄なフックになる)。IME同期の瞬間だけ発火する
+; 条件付きホットキーをひとつ置き、そのときだけ握りつぶす。
+; もう一方の sc029 は既にリマップ用のホットキーがあるので、そちらの
+; ハンドラ(RemapHandler)の先頭で同じ判定をしている。
+HotIf(InImeSyncWindow)
+Hotkey "*sc070", SwallowImeSyncKey
+HotIf()
+
+; 何も送らずに終わることで、キーをアプリにもIMEにも渡さない。
+SwallowImeSyncKey(*) {
+}
+
 ; NOTE: ThisHotkeyは "*sc029" のようにHotkeyコマンドに渡した文字列が
 ; そのまま("*"付きで)渡ってくるため、{ThisHotkey}の形でSendに渡すと
 ; 無効なキー名としてランタイムエラーになる(=該当キーが一切入力できなくなる)。
 ; そのため素通し用のスキャンコードはBindで明示的に渡す。
 RemapHandler(sc, un, sh, ThisHotkey) {
     global g_USMode
+
+    ; RDPクライアントがIME状態を巻き戻すために送り込んでくる擬似キー。
+    ; 打鍵ではないので、文字も出さず素通しもさせずに捨てる。
+    if IsImeSyncKey(sc)
+        return
 
     NoteShiftUsedAsModifier() ; このキーが押された時点でShiftは修飾キー扱いにする
 
